@@ -1,0 +1,9 @@
+streamlit>=1.33
+pandas
+numpy
+plotly
+networkx
+pyvis
+faker
+jinja2
+scipy
