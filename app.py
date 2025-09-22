@@ -348,6 +348,136 @@ if run_btn:
             file_name='referral_network.csv',
             mime='text/csv'
         )
+        # ---- Robust failure detection (single run) ----
+
+        T = int(params.get('t', 12))
+
+        # 1) joins, churns, referrals, active
+        joins_by_month = subscribers.groupby('join_month')['subscriber_id'].nunique().reindex(range(1, T+1), fill_value=0)
+        if 'end_month' in subscribers.columns:
+            churns_by_month = subscribers.groupby('end_month')['subscriber_id'].nunique().reindex(range(1, T+1), fill_value=0)
+        else:
+            churns_by_month = events[events['event_type'].str.contains('CANCEL|CHURN|STOP', na=False)].groupby('month')['subscriber_id'].nunique().reindex(range(1, T+1), fill_value=0)
+
+        new_referrals_by_month = events[events['event_type'] == 'REFERRAL'].groupby('month')['subscriber_id'].nunique().reindex(range(1, T+1), fill_value=0)
+        if new_referrals_by_month.sum() == 0:
+            # derive from subscribers if REFERRAL events are not present
+            if 'referrer_id' in subscribers.columns:
+                new_referrals_by_month = subscribers[~subscribers['referrer_id'].isna()].groupby('join_month')['subscriber_id'].nunique().reindex(range(1, T+1), fill_value=0)
+
+        active_by_month = summary.set_index('month')['active_users'].reindex(range(1, T+1), fill_value=0)
+
+        # 2) R_t and CRR (safe division)
+        Rt = new_referrals_by_month.divide(active_by_month.replace(0, np.nan)).fillna(0)
+        CRR = joins_by_month.divide(churns_by_month.replace(0, np.nan)).fillna(0)
+
+        # 3) Marginal unit economics (approx)
+        avg_life = subscribers['lifetime_months'].mean() if 'lifetime_months' in subscribers.columns else 1.0 / max(1e-6, params.get('churn_prob', 0.05))
+        pct_us = params.get('pct_us', 0.7)
+        price_us = params.get('price_us', 14.99)
+        price_other = params.get('price_other', 2.99)
+        avg_price = pct_us * price_us + (1 - pct_us) * price_other
+        expected_revenue_per_user = avg_price * avg_life
+        per_user_cost = params.get('per_user_cost', 0.01) * avg_life
+        expected_commission_per_user = network_table['total_commissions_received'].sum() / max(1, len(subscribers)) if 'total_commissions_received' in network_table.columns else 0.0
+        expected_bonus_per_user = network_table['total_bonuses_received'].sum() / max(1, len(subscribers)) if 'total_bonuses_received' in network_table.columns else 0.0
+        marginal_unit = expected_revenue_per_user - (expected_commission_per_user + expected_bonus_per_user + per_user_cost)
+
+        # 4) Concentration (top-1% share)
+        if 'total_earnings' in network_table.columns and network_table['total_earnings'].sum() > 0:
+            top1_count = max(1, int(len(network_table) * 0.01))
+            top1_share = network_table['total_earnings'].nlargest(top1_count).sum() / network_table['total_earnings'].sum()
+        else:
+            top1_share = 0.0
+
+        # 5) Failure rule checks with activity gating (tunable thresholds)
+        rt_threshold = 0.9
+        crr_threshold = 1.0
+        concentration_threshold = 0.7
+        window_len = 3
+
+        flags = {
+            'rt_decay': False,
+            'recruit_below_churn': False,
+            'neg_unit': marginal_unit < 0,
+            'sustained_loss': False,
+            'concentration_fragile': top1_share > concentration_threshold
+        }
+
+        first_fail_month = None
+        for m in range(1, T + 1):
+            window_months = list(range(max(1, m - (window_len - 1)), m + 1))
+
+            # Rt window: require at least one referral in the window and some active users
+            window_referrals = new_referrals_by_month.reindex(window_months).sum()
+            window_active = active_by_month.reindex(window_months).sum()
+            rt_window = Rt.reindex(window_months).fillna(0)
+            rt_trip = False
+            if window_active > 0 and window_referrals > 0 and (rt_window < rt_threshold).all():
+                rt_trip = True
+
+            # CRR window: require churns and joins in window
+            window_joins = joins_by_month.reindex(window_months).sum()
+            window_churns = churns_by_month.reindex(window_months).sum()
+            crr_window = CRR.reindex(window_months).fillna(0)
+            crr_trip = False
+            if window_churns > 0 and window_joins > 0 and (crr_window < crr_threshold).all():
+                crr_trip = True
+
+            # Net window: sustained negative net for full window
+            net_window = summary[(summary['month'].isin(window_months))]['net']
+            net_trip = False
+            if len(net_window) == window_len and (net_window < 0).all():
+                net_trip = True
+
+            # set flags if any trip; record first month
+            if rt_trip: flags['rt_decay'] = True
+            if crr_trip: flags['recruit_below_churn'] = True
+            if net_trip: flags['sustained_loss'] = True
+
+            if (rt_trip or crr_trip or net_trip) and first_fail_month is None:
+                first_fail_month = m
+                # keep looping to populate overall flags but first_fail recorded
+
+        # 6) Display diagnostics
+        st.subheader("Failure diagnostics (robust)")
+        st.write(f"R_t (last month): {Rt.iloc[-1]:.3f}   |   CRR (last month): {CRR.iloc[-1]:.3f}")
+        st.write(f"Marginal unit economics: ${marginal_unit:,.2f}   |   Top-1% earnings share: {top1_share:.2%}")
+        # show only true flags neatly
+        active_flags = {k: v for k, v in flags.items() if v}
+        if active_flags:
+            st.error("Flags: " + ", ".join(active_flags.keys()))
+        else:
+            st.success("No immediate failure signals detected (per configured rules).")
+
+        if first_fail_month:
+            st.error(f"Potential failure detected starting month {first_fail_month}")
+        else:
+            st.info("No failure month detected by these rules.")
+
+                # --- Failure diagnostics guide / cheat-sheet ---
+        with st.expander("ℹ️ How to read these diagnostics"):
+            st.markdown("""
+            ### 📑 Failure Diagnostics Cheat-Sheet
+
+            | **KPI / Measure**            | **Definition / Formula**                                                                                      | **What It Represents**                                                                 | **How to Read It**                                                                                                  |
+            |-------------------------------|----------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------|
+            | **Rₜ (Referral Reproduction Number)** | `Rₜ = (new referrals this month) ÷ (active subscribers this month)`                                             | Average number of **referrals each active subscriber creates**.                         | - **Rₜ > 1**: exponential referral growth 🚀 <br> - **Rₜ ≈ 1**: flat/steady state <br> - **Rₜ < 1**: shrinking tree. Red flag if **< 0.9 for 3+ months**. |
+            | **CRR (Churn Replacement Ratio)** | `CRR = (new joiners this month) ÷ (churned subscribers this month)`                                             | Balance between **new user acquisition and churn**.                                      | - **CRR > 1**: signups outpace churn 👍 <br> - **CRR = 1**: holding steady <br> - **CRR < 1**: decline. Red flag if **< 1 for 3+ months**. |
+            | **Marginal Unit Economics**  | `(Expected lifetime revenue per user) – (avg. commissions + bonuses + per-user costs)`                          | Whether each additional subscriber **adds profit or loss**.                             | - **> 0**: each new user strengthens the system ✅ <br> - **< 0**: every new user adds to losses ❌.                     |
+            | **Concentration (Top-1% Share)** | `(Earnings of top 1% of participants) ÷ (Total earnings)`                                                      | How **skewed** earnings distribution is across participants.                            | - **< 30%**: healthy, broad distribution 🌍 <br> - **30–70%**: normal MLM skew <br> - **> 70%**: fragile “winner-takes-all” risk ⚠️. |
+            | **Sustained Losses**         | Checks if **Net Profit** (Revenue – Commissions – Bonuses – Costs) is negative **3 months in a row**.           | Signals whether the company itself is burning cash for a sustained period.               | - **No sustained losses**: financially stable. <br> - **3+ months negative**: risk of collapse or funding gap.         |
+            | **First Failure Month**      | Earliest month where **any flag** (above rules) triggered for a 3-month window.                                  | The **tipping point** where sustainability breaks down.                                  | - Reported as “Potential failure detected at month X.” <br> If none: “No failure detected.” ✅                          |
+
+            ---
+            **How to use in practice:**
+            - **Rₜ & CRR** → your growth engine health gauges  
+            - **Marginal Unit** → profitability per subscriber  
+            - **Concentration** → fairness & fragility of payouts  
+            - **Sustained Losses** → company-level sustainability  
+            - **First Failure Month** → the tipping point into collapse
+            """, unsafe_allow_html=True)
+
 
         # monthly chart
         st.subheader("Monthly Revenue / Commission / Bonus / Operating Cost")
@@ -399,6 +529,23 @@ if run_btn:
         progress_bar.empty()
         df_nets = mc_out['final_nets']
         ts_pct = mc_out['ts_percentiles']
+                # assume mc_out includes per-run summaries or we recompute per-run flags inside run_monte_carlo
+        # Example: run_monte_carlo returns 'fail_month' per run (None or month)
+        fail_months = mc_out.get('fail_months', None)
+        if fail_months is None:
+            # If not present, we recommend modifying run_monte_carlo to compute the single-run flags (same logic as above) and return fail_month per run
+            st.info("Monte Carlo did not include per-run failure months. Consider computing fail_month inside run_monte_carlo.")
+        else:
+            # P(failure by month m)
+            import pandas as pd
+            fm = pd.Series([v if v is not None else t+1 for v in fail_months])  # t+1 means no failure
+            probs = [(fm <= m).mean() for m in range(1, t+1)]
+            fig_pf = go.Figure()
+            fig_pf.add_trace(go.Scatter(x=list(range(1,t+1)), y=probs, mode='lines+markers'))
+            fig_pf.update_layout(title='P(failure by month m)', xaxis_title='Month', yaxis_title='Probability', height=350)
+            st.plotly_chart(fig_pf, use_container_width=True)
+            st.metric("P(failure ever)", f"{(fm <= t).mean():.2%}")
+
 
         st.subheader("Monte Carlo: final net profit per run (distribution)")
         st.dataframe(df_nets.describe().T)
